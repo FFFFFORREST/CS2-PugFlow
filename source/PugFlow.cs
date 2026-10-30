@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
@@ -9,16 +10,17 @@ using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.Utils;
 
-namespace WarmupStartVote;
+namespace PugFlow;
 
 /// <summary>
-/// Warmup -> chat vote -> knife round -> winning team picks stay/swap -> live MR12.
+/// Warmup -> chat vote -> knife round -> winning team picks a side (!ct/!t or !stay/!swap) -> live MR12.
+/// On Rush maps: the same warmup and vote, then straight to a live Rush match (no knife round).
 /// Independent of RockTheVote-CSS. Built against the server's own CSS API DLL.
 /// </summary>
-public sealed class WarmupStartVotePlugin : BasePlugin
+public sealed class PugFlowPlugin : BasePlugin
 {
-    public override string ModuleName => "Warmup Start Vote";
-    public override string ModuleVersion => "1.2.2";
+    public override string ModuleName => "PugFlow";
+    public override string ModuleVersion => "1.6.0";
     public override string ModuleAuthor => "CS2 community server";
     public override string ModuleDescription => "Free warmup, start vote, knife round, winning-team side pick, live match";
 
@@ -34,8 +36,25 @@ public sealed class WarmupStartVotePlugin : BasePlugin
     // Warmup is one endless round, so outside a live match .drop uses a time cooldown.
     private const int DropCooldownSeconds = 30;
 
+    // Game time only resets on a map change. After hours on one map it is large enough to lose
+    // float precision and weapon/hand animations play in slow motion, so an empty server
+    // reloads its map once the map has run this long.
+    private const float StaleMapSeconds = 3600f;
+    private const float StaleMapCheckSeconds = 60f;
+
     // RoundEndReason.GameCommencing: round_end fired by a restart, not by a real round result.
     private const int GameCommencingReason = 16;
+
+    // Mirror configs/plugins/RockTheVote/RockTheVote.json so !help matches what RockTheVote
+    // allows; update these if that config changes.
+    private const int RtvMapStartDelaySeconds = 180;
+    private static readonly string[] NominatePermissions = { "@css/vip", "@css/nominate" };
+    private const string MapMenuPermission = "@css/changemap";
+
+    // Rush maps run Valve's own Rush rules (the ModeSwitcher plugin sets game_mode 6 for them).
+    // They get the same free warmup and start vote, but no knife round, and go live with
+    // rush_live.cfg instead of live.cfg. Keep in sync with ModeSwitcher's list.
+    private static readonly string[] RushMaps = { "rush_001" };
 
     private enum MatchPhase { Warmup, Voting, KnifePending, KnifeActive, SidePick, Live }
     private MatchPhase _phase = MatchPhase.Warmup;
@@ -49,6 +68,10 @@ public sealed class WarmupStartVotePlugin : BasePlugin
     private int _roundSerial;
     private readonly Dictionary<ulong, int> _dropRound = new();
     private readonly Dictionary<ulong, DateTimeOffset> _dropTime = new();
+    private DateTimeOffset _mapStarted = DateTimeOffset.MinValue;
+
+    // Unavailable returns null when the player can use the command right now, else a short reason.
+    private sealed record PlayerCommand(string Name, string Description, Func<CCSPlayerController, string?> Unavailable);
 
     public override void Load(bool hotReload)
     {
@@ -59,6 +82,10 @@ public sealed class WarmupStartVotePlugin : BasePlugin
         AddCommand("css_startno", "Vote NO to start", VoteNo);
         AddCommand("css_stay", "Knife winner keeps their current side", Stay);
         AddCommand("css_swap", "Knife winner swaps CT and T sides", Swap);
+        AddCommand("css_ct", "Knife winner takes the CT side", PickCT);
+        AddCommand("css_t", "Knife winner takes the T side", PickT);
+        AddCommand("css_help", "List player commands and whether they work right now", Help);
+        AddCommand("css_commands", "List player commands and whether they work right now", Help);
         AddCommand("css_startstatus", "Show match phase / vote status", Status);
         AddCommand("css_startreset", "Admin: abort vote/knife/match and restore free warmup", ForceReset);
         AddCommandListener("say", OnChat);
@@ -66,9 +93,13 @@ public sealed class WarmupStartVotePlugin : BasePlugin
 
         RegisterListener<Listeners.OnMapStart>(OnMapStart);
         RegisterListener<Listeners.OnMapEnd>(OnMapEnd);
+        // Not STOP_ON_MAPCHANGE: this one runs for the plugin's whole lifetime.
+        AddTimer(StaleMapCheckSeconds, RefreshStaleMap, TimerFlags.REPEAT);
         // Restart the cs2 systemd service after deploying, rather than hot-reloading
         // into a live match; this plugin doesn't guess the state of an existing match.
     }
+
+    private static bool OnRushMap() => RushMaps.Contains(Server.MapName, StringComparer.OrdinalIgnoreCase);
 
     private static bool Human(CCSPlayerController? p) =>
         p is { IsValid: true } && !p.IsBot && !p.IsHLTV && p.SteamID != 0;
@@ -123,21 +154,21 @@ public sealed class WarmupStartVotePlugin : BasePlugin
         if (!Human(p)) return;
         if (_phase != MatchPhase.Warmup)
         {
-            p!.PrintToChat("[StartVote] Only available during free warmup. !startstatus");
+            p!.PrintToChat("[PugFlow] Only available during free warmup. !startstatus");
             return;
         }
 
         var online = Humans();
         if (online.Count < MinimumPlayers)
         {
-            p!.PrintToChat($"[StartVote] Need at least {MinimumPlayers} human player(s).");
+            p!.PrintToChat($"[PugFlow] Need at least {MinimumPlayers} human player(s).");
             return;
         }
         // Cooldown counts from when the previous vote failed, not from when it started.
         var remaining = StartVoteCooldownSeconds - (DateTimeOffset.UtcNow - _lastVoteFailed).TotalSeconds;
         if (remaining > 0)
         {
-            p!.PrintToChat($"[StartVote] Wait {Math.Ceiling(remaining)}s before trying again.");
+            p!.PrintToChat($"[PugFlow] Wait {Math.Ceiling(remaining)}s before trying again.");
             return;
         }
 
@@ -145,8 +176,8 @@ public sealed class WarmupStartVotePlugin : BasePlugin
         ClearBallots();
         var serial = _voteSerial;
 
-        Server.PrintToChatAll($"[StartVote] {p!.PlayerName} started a match vote! {NeededYes(online.Count)}/{online.Count} YES needed (50%).");
-        Server.PrintToChatAll($"[StartVote] Type !yes or !no within {(int)StartVoteSeconds} seconds. Proposer must also vote.");
+        Server.PrintToChatAll($"[PugFlow] {p!.PlayerName} started a match vote! {NeededYes(online.Count)}/{online.Count} YES needed (50%).");
+        Server.PrintToChatAll($"[PugFlow] Type !yes or !no within {(int)StartVoteSeconds} seconds. Proposer must also vote.");
         AddTimer(StartVoteSeconds, () =>
         {
             if (_phase != MatchPhase.Voting || serial != _voteSerial) return;
@@ -162,20 +193,20 @@ public sealed class WarmupStartVotePlugin : BasePlugin
         if (!Human(p)) return;
         if (_phase != MatchPhase.Voting)
         {
-            p!.PrintToChat("[StartVote] No open start vote. Use !votestart in warmup.");
+            p!.PrintToChat("[PugFlow] No open start vote. Use !votestart in warmup.");
             return;
         }
 
         var id = p!.SteamID;
         if (_yes.Contains(id) || _no.Contains(id))
         {
-            p.PrintToChat("[StartVote] Your vote is already counted.");
+            p.PrintToChat("[PugFlow] Your vote is already counted.");
             return;
         }
         if (yes) _yes.Add(id); else _no.Add(id);
 
         int online = PruneBallots();
-        Server.PrintToChatAll($"[StartVote] YES {_yes.Count}, NO {_no.Count} | {NeededYes(online)} YES needed ({online} online).");
+        Server.PrintToChatAll($"[PugFlow] YES {_yes.Count}, NO {_no.Count} | {NeededYes(online)} YES needed ({online} online).");
         EvaluateVote(online);
     }
 
@@ -198,11 +229,20 @@ public sealed class WarmupStartVotePlugin : BasePlugin
         ClearBallots();
         _phase = MatchPhase.Warmup;
         _lastVoteFailed = DateTimeOffset.UtcNow;
-        Server.PrintToChatAll($"[StartVote] {message}");
+        Server.PrintToChatAll($"[PugFlow] {message}");
     }
 
     private void BeginKnifeOrSoloLive()
     {
+        if (OnRushMap())
+        {
+            // Rush has no halftime, so there is no side to pick and no knife round.
+            _phase = MatchPhase.Live;
+            Server.PrintToChatAll("[PugFlow] Vote passed! RUSH is LIVE: 15 rounds, first to 8 wins. !help lists commands.");
+            Server.ExecuteCommand("exec rush_live.cfg");
+            return;
+        }
+
         var teams = Humans();
         bool hasT = teams.Any(x => x.Team == CsTeam.Terrorist);
         bool hasCT = teams.Any(x => x.Team == CsTeam.CounterTerrorist);
@@ -211,7 +251,8 @@ public sealed class WarmupStartVotePlugin : BasePlugin
             // Can't determine a winner with one side empty. Preserve the
             // one-person testing workflow and begin live without a knife round.
             _phase = MatchPhase.Live;
-            Server.PrintToChatAll("[StartVote] Vote passed! No human opponents on both sides: skipping knife round.");
+            Server.PrintToChatAll("[PugFlow] Vote passed! No human opponents on both sides: skipping knife round.");
+            Server.PrintToChatAll("[Match] 12:12 goes to MR3 overtime, repeated until a team wins. !help lists commands.");
             Server.ExecuteCommand("exec live.cfg");
             return;
         }
@@ -219,7 +260,7 @@ public sealed class WarmupStartVotePlugin : BasePlugin
         _phase = MatchPhase.KnifePending;
         _knifeWinnerTeam = 0;
         _knifeWinners.Clear();
-        Server.PrintToChatAll("[StartVote] Vote passed! KNIFE ROUND: knives only. Winner chooses !stay or !swap.");
+        Server.PrintToChatAll("[PugFlow] Vote passed! KNIFE ROUND: knives only. Winners pick a side with !ct / !t (or !stay / !swap).");
         Server.ExecuteCommand("exec knife.cfg");
     }
 
@@ -263,7 +304,7 @@ public sealed class WarmupStartVotePlugin : BasePlugin
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[WarmupStartVote] Knife weapon assignment failed for {id}: {ex}");
+                Console.WriteLine($"[PugFlow] Knife weapon assignment failed for {id}: {ex}");
             }
         }, TimerFlags.STOP_ON_MAPCHANGE);
         return HookResult.Continue;
@@ -299,7 +340,7 @@ public sealed class WarmupStartVotePlugin : BasePlugin
         _phase = MatchPhase.SidePick;
         int serial = ++_sideSerial;
         string side = _knifeWinnerTeam == (int)CsTeam.CounterTerrorist ? "CT" : "T";
-        Server.PrintToChatAll($"[Knife] {side} won! A player from the winning team must type !stay or !swap.");
+        Server.PrintToChatAll($"[Knife] {side} won! A player from the winning team picks a side: !ct or !t (or !stay / !swap).");
         Server.PrintToChatAll($"[Knife] {SidePickSeconds:0}s to choose; timeout defaults to STAY.");
 
         // Keep the server in warmup while waiting for the choice, instead
@@ -322,6 +363,13 @@ public sealed class WarmupStartVotePlugin : BasePlugin
 
     private void Stay(CCSPlayerController? p, CommandInfo info) => ChooseSide(p, swap: false);
     private void Swap(CCSPlayerController? p, CommandInfo info) => ChooseSide(p, swap: true);
+    private void PickCT(CCSPlayerController? p, CommandInfo info) => ChooseTeam(p, CsTeam.CounterTerrorist);
+    private void PickT(CCSPlayerController? p, CommandInfo info) => ChooseTeam(p, CsTeam.Terrorist);
+
+    // !ct / !t name the side the knife winners want to play; that is a swap
+    // exactly when it differs from the side they won the knife round on.
+    private void ChooseTeam(CCSPlayerController? p, CsTeam side) =>
+        ChooseSide(p, swap: (int)side != _knifeWinnerTeam);
 
     private void ChooseSide(CCSPlayerController? p, bool swap)
     {
@@ -342,6 +390,7 @@ public sealed class WarmupStartVotePlugin : BasePlugin
     private void StartLive(bool swap)
     {
         if (_phase != MatchPhase.SidePick) return;
+        bool winnersAreCT = (_knifeWinnerTeam == (int)CsTeam.CounterTerrorist) != swap;
         _phase = MatchPhase.Live;
         ++_sideSerial;
         _knifeWinners.Clear();
@@ -359,11 +408,12 @@ public sealed class WarmupStartVotePlugin : BasePlugin
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[WarmupStartVote] Team swap failed for {player.PlayerName}: {ex}");
+                    Console.WriteLine($"[PugFlow] Team swap failed for {player.PlayerName}: {ex}");
                 }
             }
         }
-        Server.PrintToChatAll($"[Knife] {(swap ? "SWAP" : "STAY")} selected. Starting LIVE MR12 now!");
+        Server.PrintToChatAll($"[Knife] {(swap ? "SWAP" : "STAY")}: knife winners play {(winnersAreCT ? "CT" : "T")}. Starting LIVE MR12 now!");
+        Server.PrintToChatAll("[Match] 12:12 goes to MR3 overtime, repeated until a team wins. !help lists commands.");
         // live.cfg also resets round scores, removes warmup equipment rules,
         // restores economy and respawn rules, and restarts the match.
         Server.ExecuteCommand("exec live.cfg");
@@ -375,15 +425,89 @@ public sealed class WarmupStartVotePlugin : BasePlugin
         var count = _phase == MatchPhase.Voting ? PruneBallots() : Humans().Count;
         var details = _phase switch
         {
+            MatchPhase.Warmup when OnRushMap() => $"Rush map, free warmup ({count} online). Type !votestart to start Rush.",
+            MatchPhase.Live when OnRushMap() => "Rush match is LIVE.",
             MatchPhase.Warmup => $"Free warmup ({count} online). Type !votestart.",
             MatchPhase.Voting => $"Voting: {_yes.Count} YES, {_no.Count} NO. {NeededYes(count)} YES needed.",
             MatchPhase.KnifePending => "Knife round is starting.",
             MatchPhase.KnifeActive => "Knife round active.",
-            MatchPhase.SidePick => "Knife winner must choose !stay or !swap.",
+            MatchPhase.SidePick => "Knife winner must choose !ct / !t (or !stay / !swap).",
             MatchPhase.Live => "Competitive match is LIVE.",
             _ => "Unknown"
         };
-        p!.PrintToChat("[StartVote] " + details);
+        p!.PrintToChat("[PugFlow] " + details + " !help lists commands.");
+    }
+
+    private string PhaseName() => _phase switch
+    {
+        MatchPhase.Warmup when OnRushMap() => "Rush map, free warmup",
+        MatchPhase.Live when OnRushMap() => "Live Rush match",
+        MatchPhase.Warmup => "Free warmup",
+        MatchPhase.Voting => "Start vote open",
+        MatchPhase.KnifePending => "Knife round starting",
+        MatchPhase.KnifeActive => "Knife round",
+        MatchPhase.SidePick => "Knife winners picking a side",
+        MatchPhase.Live => "Live match",
+        _ => "Unknown"
+    };
+
+    private static bool HasAnyPermission(CCSPlayerController p, IEnumerable<string> permissions) =>
+        permissions.Any(x => AdminManager.PlayerHasPermissions(p, x));
+
+    private string? SidePickBlocker(CCSPlayerController p) =>
+        _phase != MatchPhase.SidePick ? "after the knife round"
+        : !_knifeWinners.Contains(p.SteamID) ? "knife winners only"
+        : null;
+
+    // Every chat command a player might try on this server, ours and RockTheVote's,
+    // each with whether it works for this player in the current phase.
+    private IEnumerable<PlayerCommand> PlayerCommands() => new PlayerCommand[]
+    {
+        new("!votestart", "start the match vote", _ =>
+        {
+            if (_phase != MatchPhase.Warmup) return "free warmup only";
+            var wait = StartVoteCooldownSeconds - (DateTimeOffset.UtcNow - _lastVoteFailed).TotalSeconds;
+            return wait > 0 ? $"wait {Math.Ceiling(wait)}s" : null;
+        }),
+        new("!yes / !no", "vote on the start vote", p =>
+            _phase != MatchPhase.Voting ? "no vote open"
+            : _yes.Contains(p.SteamID) || _no.Contains(p.SteamID) ? "already voted"
+            : null),
+        new("!ct / !t", "knife winners pick their side", SidePickBlocker),
+        new("!stay / !swap", "knife winners keep or swap sides", SidePickBlocker),
+        new(".drop", "drop knives for others to pick up", _ =>
+            _phase is MatchPhase.KnifePending or MatchPhase.KnifeActive ? "not in the knife round" : null),
+        new("!startstatus", "show the match phase", _ => null),
+        new("!votemap <map>", "vote to change the map", _ => null),
+        new("!rtv", "rock the vote for a new map", _ =>
+            InWarmup() ? "not during warmup"
+            : (DateTimeOffset.UtcNow - _mapStarted).TotalSeconds < RtvMapStartDelaySeconds ? "3 min after map start"
+            : null),
+        new("!nominate <map>", "nominate the next map", p =>
+            HasAnyPermission(p, NominatePermissions) ? null : "VIP only"),
+        new("!maps / !timeleft", "map list / time left", _ => null),
+        new("!menutype", "change the vote menu style", _ => null),
+        new("!extend", "vote to extend the map", _ => "disabled on this server"),
+        new("!mapmenu", "admin: pick the next map", p =>
+            AdminManager.PlayerHasPermissions(p, MapMenuPermission) ? null : "admin only"),
+        new("!startreset", "admin: back to free warmup", p =>
+            AdminManager.PlayerHasPermissions(p, ResetPermission) ? null : "admin only"),
+    };
+
+    private void Help(CCSPlayerController? p, CommandInfo info)
+    {
+        if (!Human(p)) return;
+        var player = p!;
+        // CS2 chat only applies colours when the message doesn't start with one, hence the leading space.
+        player.PrintToChat($" {ChatColors.Gold}[Commands]{ChatColors.Default} {PhaseName()}. {ChatColors.Green}Green{ChatColors.Default} = works now, {ChatColors.Grey}grey{ChatColors.Default} = not now.");
+        foreach (var command in PlayerCommands())
+        {
+            var reason = command.Unavailable(player);
+            player.PrintToChat(reason == null
+                ? $" {ChatColors.Green}{command.Name}{ChatColors.Default} {command.Description}"
+                : $" {ChatColors.Grey}{command.Name} {command.Description} ({reason})");
+        }
+        player.PrintToChat($" {ChatColors.Grey}Not on this server: !ready !pause !unpause !tech !gg");
     }
 
     private void ForceReset(CCSPlayerController? p, CommandInfo info)
@@ -391,11 +515,11 @@ public sealed class WarmupStartVotePlugin : BasePlugin
         // p == null is the server console / RCON.
         if (p != null && !AdminManager.PlayerHasPermissions(p, ResetPermission))
         {
-            info.ReplyToCommand($"[StartVote] You need {ResetPermission} to use this.");
+            info.ReplyToCommand($"[PugFlow] You need {ResetPermission} to use this.");
             return;
         }
         ReturnToWarmup("An admin reset the match. Free warmup restored.");
-        info.ReplyToCommand("[StartVote] Reset to free warmup.");
+        info.ReplyToCommand("[PugFlow] Reset to free warmup.");
     }
 
     // ".drop" in chat: drop copies of the player's own knife at their feet for others to pick up.
@@ -479,7 +603,7 @@ public sealed class WarmupStartVotePlugin : BasePlugin
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[WarmupStartVote] Knife drop failed for {id}: {ex}");
+                Console.WriteLine($"[PugFlow] Knife drop failed for {id}: {ex}");
             }
         }
         if (dropped == 0)
@@ -514,11 +638,16 @@ public sealed class WarmupStartVotePlugin : BasePlugin
     private void OnMapStart(string mapName)
     {
         ResetForMap();
+        _mapStarted = DateTimeOffset.UtcNow;
+        // Runs after the gamemode cfg, so Rush maps also get free warmup; rush_live.cfg
+        // restores Rush rules when the match starts.
         AddTimer(3f, () =>
         {
             if (_phase != MatchPhase.Warmup) return;
             Server.ExecuteCommand("exec practice.cfg");
-            Server.PrintToChatAll("[StartVote] Free warmup. !votestart -> knife round -> side pick -> live.");
+            Server.PrintToChatAll(OnRushMap()
+                ? "[PugFlow] Rush map, free warmup. !votestart -> live Rush (no knife round). !help lists commands."
+                : "[PugFlow] Free warmup. !votestart -> knife round -> side pick -> live. !help lists commands.");
         }, TimerFlags.STOP_ON_MAPCHANGE);
     }
 
@@ -540,7 +669,7 @@ public sealed class WarmupStartVotePlugin : BasePlugin
     {
         ResetForMap();
         Server.ExecuteCommand("exec practice.cfg");
-        Server.PrintToChatAll($"[StartVote] {message}");
+        Server.PrintToChatAll($"[PugFlow] {message}");
     }
 
     [GameEventHandler]
@@ -550,7 +679,7 @@ public sealed class WarmupStartVotePlugin : BasePlugin
         // map cycle CS2 stays there; reload the map so OnMapStart restores warmup.
         // The timer dies on map change, so a map picked by RockTheVote wins.
         var map = Server.MapName;
-        Server.PrintToChatAll($"[StartVote] Match over. Reloading the map in {MatchEndReloadSeconds:0}s for free warmup.");
+        Server.PrintToChatAll($"[PugFlow] Match over. Reloading the map in {MatchEndReloadSeconds:0}s for free warmup.");
         AddTimer(MatchEndReloadSeconds, () =>
         {
             if (Server.MapName != map) return;
@@ -559,12 +688,52 @@ public sealed class WarmupStartVotePlugin : BasePlugin
         return HookResult.Continue;
     }
 
-    private static void ReloadMap(string map)
+    private void RefreshStaleMap()
     {
-        // Workshop maps aren't valid changelevel targets; ds_workshop_changelevel
-        // handles maps from the server's hosted workshop collection.
-        Server.ExecuteCommand(Server.IsMapValid(map)
-            ? $"changelevel {map}"
+        if (Server.CurrentTime < StaleMapSeconds || Humans().Count > 0) return;
+        var map = Server.MapName;
+        Console.WriteLine($"[PugFlow] Server empty and {map} has run {Server.CurrentTime / 3600:0.0}h: reloading it to reset game time.");
+        ReloadMap(map);
+    }
+
+    private void ReloadMap(string map)
+    {
+        if (Server.IsMapValid(map))
+        {
+            Server.ExecuteCommand($"changelevel {map}");
+            return;
+        }
+        // Workshop maps aren't valid changelevel targets. Maps listed with their ID in
+        // RockTheVote's map list load by ID; ds_workshop_changelevel only works for maps
+        // in a hosted workshop collection, which this server doesn't use.
+        var workshopId = WorkshopIdFromRtvMapList(map);
+        Server.ExecuteCommand(workshopId != null
+            ? $"host_workshop_map {workshopId}"
             : $"ds_workshop_changelevel {map}");
+    }
+
+    // RockTheVote's maplist.txt lists workshop maps as "name:workshopId"; the name is the
+    // map's internal name (what Server.MapName reports), e.g. "fy_snow_legacy:3592238209".
+    private string? WorkshopIdFromRtvMapList(string map)
+    {
+        var path = Path.Combine(ModuleDirectory, "..", "RockTheVote", "maplist.txt");
+        try
+        {
+            foreach (var raw in File.ReadLines(path))
+            {
+                var line = raw.Trim();
+                if (line.Length == 0 || line.StartsWith("//")) continue;
+                var colon = line.LastIndexOf(':');
+                if (colon <= 0) continue;
+                var id = line[(colon + 1)..].Trim();
+                if (line[..colon].Trim().Equals(map, StringComparison.OrdinalIgnoreCase) && id.All(char.IsDigit) && id.Length > 0)
+                    return id;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[PugFlow] Could not read {path}: {ex.Message}");
+        }
+        return null;
     }
 }

@@ -1,4 +1,4 @@
-# WarmupStartVote v1.2.2 — 无限热身 + 开赛投票 + 刀战选边 + .drop 发刀
+# CS2-PugFlow v1.6.0 — 无限热身 + 开赛投票 + 刀战选边 + .drop 发刀 + 无限加时 + !help 指令表
 
 适用：AWS Lightsail / Ubuntu 24.04、CS2 Dedicated Server、CounterStrikeSharp v1.0.376（.NET 10）。**与 RockTheVote-CSS 独立，不占用其 `!rtv`、`!nominate`、`!votemap`、`!maps` 命令。**
 
@@ -10,8 +10,8 @@
 2. 任意玩家输入 `!votestart`，开始 25 秒开赛投票。
 3. 玩家输入 `!yes` / `!no`；赞成达到 `ceil(当前在线真人 × 50%)`，立即结束投票。
 4. **双方各至少一名真人玩家**：服务器执行 `knife.cfg`，重新开始一局**只有刀、不能买枪、不能复活**的刀战。刀战输赢由 CS2 的 `round_end` 事件判断（CT 或 T）。
-5. 刀战胜方成员任选一人输入 `!stay`（保持当前 CT/T）或 `!swap`（CT/T 交换）；获胜队先输入的有效选择生效。其他玩家不能替获胜队决定。
-6. 选边后执行 `live.cfg`，**比分归零、恢复 $800 初始经济、正常买枪规则，MR12 正式比赛开始**。
+5. 刀战胜方成员任选一人输入 `!ct` / `!t`（直接说要打哪一边），或 `!stay`（保持当前 CT/T）/ `!swap`（CT/T 交换）；获胜队先输入的有效选择生效。其他玩家不能替获胜队决定。
+6. 选边后执行 `live.cfg`，**比分归零、恢复 $800 初始经济、正常买枪规则，MR12 正式比赛开始**。12:12 平局时进入 **MR3 加时**（6 回合、每人 $12500），加时再平就继续加时，**直到分出胜负**，不会以平局结束。
 7. 刀战结束后如果获胜队 30 秒内没有选边，默认 `!stay`，自动开赛，避免卡住。
 8. 正式比赛结束、出现结算画面 15 秒后，插件会重新加载当前地图，回到无限热身（玩家不会被踢出服务器）。如果 RockTheVote 在这之前已经切换到新地图，就以 RockTheVote 选的地图为准，同样进入无限热身。
 9. 投票、刀战、选边或正式比赛进行中，如果真人玩家全部退出，插件会自动回到无限热身，不会卡在比赛状态。
@@ -27,24 +27,30 @@
 | `!votestart` | 发起开赛投票 | 所有玩家，至少 1 人 |
 | `!yes` / `!startyes` | 赞成开赛 | 所有玩家 |
 | `!no` / `!startno` | 反对开赛 | 所有玩家 |
+| `!ct` / `!t` | 刀战胜方直接选择打 CT 或 T | 刀战胜方任一成员 |
 | `!stay` | 刀战胜方保持原阵营 | 刀战胜方任一成员 |
 | `!swap` | 刀战胜方与败方交换 CT/T | 刀战胜方任一成员 |
 | `!startstatus` | 当前状态和开票情况 | 所有玩家 |
+| `!help` / `!commands` | 列出服务器上的所有聊天指令（含 RockTheVote 的），绿色 = 现在能用，灰色 = 现在不能用并注明原因 | 所有玩家 |
 | `.drop` | 在自己脚下掉 5 把自己的刀，给其他玩家捡 | 活着且在 T/CT 的玩家；刀战中不可用。正式比赛每回合限一次，其他时候冷却 30 秒 |
 | `!startreset` | 中止投票/刀战/比赛，强制回到无限热身 | 拥有 `@css/generic` 权限的管理员，或服务器控制台 / RCON（`css_startreset`） |
 
 **选边是聊天命令，不是 F1/F2 或图形按钮。** `.drop` 用的是点号开头，直接在聊天框输入 `.drop`，全体聊天和队伍聊天都可以。 RockTheVote 的地图投票功能仍由原插件处理。
 
+**`!ct` 与 CS2MenuManager 的冲突：** CS2MenuManager 默认把 `css_ct` 当作"切换菜单样式"的快捷命令（配置 `configs/plugins/CS2MenuManager_MenuManager/CS2MenuManager_MenuManager.json` 的 `ChangeMenuTypeCommands`）。不改的话，输入 `!ct` 会同时弹出菜单样式选择。需要把其中的 `"css_ct"` 删掉，只保留 `"css_menutype"`，切换菜单样式改用 `!menutype`。
+
+**`!help` 里的 RockTheVote 规则：** `!help` 无法读取 RockTheVote 的内部状态，是按 `RockTheVote.json` 的配置推算的：`!rtv` 热身中不可用、换图后 3 分钟内不可用；`!nominate` 需要 `@css/vip` 或 `@css/nominate`；`!extend` 已关闭；`!mapmenu` 需要 `@css/changemap`。修改 RockTheVote 配置后，同步修改源码里的 `RtvMapStartDelaySeconds`、`NominatePermissions`、`MapMenuPermission` 和 `PlayerCommands()` 列表。
+
 ## 三、安装 / 从 v1.0 升级
 
-你如果还没安装上一版 `WarmupStartVote.zip`，直接安装本版即可。如果已安装旧版（v1.0 ~ v1.2.1），`install.sh` 会在**编译成功后**停止 CS2、替换旧 DLL，备份 `server.cfg`、`practice.cfg`、`live.cfg`、`knife.cfg` 和旧插件 DLL，然后重启。部署中途出错时脚本会自动把 CS2 重新拉起来，不会让服务器一直停着。
+你如果还没安装上一版 `PugFlow.zip`，直接安装本版即可。如果已安装旧版（v1.0 ~ v1.2.1），`install.sh` 会在**编译成功后**停止 CS2、替换旧 DLL，备份 `server.cfg`、`practice.cfg`、`live.cfg`、`knife.cfg` 和旧插件 DLL，然后重启。部署中途出错时脚本会自动把 CS2 重新拉起来，不会让服务器一直停着。
 
 ### 1. 将本 ZIP 上传到 Lightsail
 
 用 Windows PowerShell（**电脑本地**）运行，替换路径和 IP：
 
 ```powershell
-scp -i "C:\path\to\LightsailDefaultKey-us-east-1.pem" "C:\path\to\WarmupStartVote_v1.2.2_knife.zip" ubuntu@你的静态IP:/home/ubuntu/
+scp -i "C:\path\to\LightsailDefaultKey-us-east-1.pem" "C:\path\to\CS2-PugFlow.zip" ubuntu@你的静态IP:/home/ubuntu/
 ```
 
 或者用 WinSCP/SFTP 把 ZIP 传到 `/home/ubuntu/`。
@@ -61,11 +67,11 @@ cd /home/ubuntu
 ```
 
 ```bash
-unzip -o WarmupStartVote_v1.2.2_knife.zip
+unzip -o CS2-PugFlow.zip
 ```
 
 ```bash
-cd /home/ubuntu/WarmupStartVote
+cd /home/ubuntu/PugFlow
 ```
 
 ```bash
@@ -74,7 +80,7 @@ bash install.sh
 
 安装脚本会从当前 CounterStrikeSharp 目录提取 API DLL 用于编译，成功后才会部署。编译需要对应的 .NET 10 SDK。
 
-注意：如已安装旧版，本包解压会覆盖 `/home/ubuntu/WarmupStartVote/` 的旧**源码**，并在编译成功后更新服务器中的插件 DLL；RockTheVote-CSS 文件不动。
+注意：如已安装旧版，本包解压会覆盖 `/home/ubuntu/PugFlow/` 的旧**源码**，并在编译成功后更新服务器中的插件 DLL；RockTheVote-CSS 文件不动。
 
 ### 3. 检查状态
 
@@ -83,11 +89,11 @@ sudo systemctl status cs2 --no-pager
 ```
 
 ```bash
-sudo journalctl -u cs2 -n 150 --no-pager | grep -Ei 'WarmupStartVote|Warmup Start Vote|error|exception'
+sudo journalctl -u cs2 -n 150 --no-pager | grep -Ei 'PugFlow|PugFlow|error|exception'
 ```
 
 ```bash
-sudo ls -lh /home/steam/cs2/game/csgo/addons/counterstrikesharp/plugins/WarmupStartVote/WarmupStartVote.dll
+sudo ls -lh /home/steam/cs2/game/csgo/addons/counterstrikesharp/plugins/PugFlow/PugFlow.dll
 ```
 
 ## 四、实际测试
@@ -102,7 +108,7 @@ sudo ls -lh /home/steam/cs2/game/csgo/addons/counterstrikesharp/plugins/WarmupSt
 
 - 两人在不同阵营加入，执行 `!votestart`，再投 `!yes`。
 - 预期：进入刀战。枪械被移除，只保留刀；正常只打一个回合。
-- 刀战赢家所在队的一名玩家输入 `!stay` / `!swap`。
+- 刀战赢家所在队的一名玩家输入 `!ct` / `!t`（或 `!stay` / `!swap`）。`!ct` / `!t` 选的是**获胜队要打的那一边**：已经在 CT 的获胜队输入 `!ct` 等于留边，输入 `!t` 等于换边。
 - 如果 `!swap`，两队阵营交换（场上的 Bot 也一起换边）；然后比赛重启，比分从 0:0 开始，经济恢复正常。
 - 也可不选边，等待 30 秒，默认留边正式开赛。
 
@@ -110,7 +116,7 @@ sudo ls -lh /home/steam/cs2/game/csgo/addons/counterstrikesharp/plugins/WarmupSt
 
 ## 五、插件源码里可调整的参数
 
-`source/WarmupStartVote.cs`：
+`source/PugFlow.cs`：
 
 - `MinimumPlayers = 1` — 最少允许开票人数
 - `ApprovalFraction = 0.50` — 50% 赞成通过
@@ -126,13 +132,13 @@ sudo ls -lh /home/steam/cs2/game/csgo/addons/counterstrikesharp/plugins/WarmupSt
 
 `configs/`：
 
-- `practice.cfg` — 无限热身、随地免费购买
+- `practice.cfg` — 无限热身、随地免费购买、关闭 Bot（`bot_quota 0`；服务器设置了 `sv_hibernate_when_empty 0` 不再休眠，没人时 Bot 会一直占用 CPU）
 - `knife.cfg` — 刀局规则、只给刀、禁止购买和炸弹
-- `live.cfg` — 选边后 MR12、比分重置、恢复经济
+- `live.cfg` — 选边后 MR12、比分重置、恢复经济、关闭 Bot；12:12 进入 MR3 加时（`mp_overtime_*`），`mp_overtime_limit 0` 表示加时次数不限
 
 三个 cfg 都默认**关闭友伤**（`mp_friendlyfire 0`）。想在某个阶段开启友伤，就把对应 cfg 里的这一行改成 `mp_friendlyfire 1`。
 
-不建议在 `server.cfg` 额外写 `exec knife.cfg` 或 `exec live.cfg`；插件会自动调用。
+不要在 `server.cfg` 里写 `exec practice.cfg`、`exec knife.cfg` 或 `exec live.cfg`；插件会自动调用（从 v1.4.0 起 `practice.cfg` 也由插件在换图 3 秒后执行；v1.5.0 起 Rush 地图上也执行，开赛时用 `rush_live.cfg`）。
 
 ## 六、备份及回退
 
@@ -143,10 +149,10 @@ sudo systemctl stop cs2
 ```
 
 ```bash
-sudo mv /home/steam/cs2/game/csgo/addons/counterstrikesharp/plugins/WarmupStartVote /home/ubuntu/WarmupStartVote-disabled
+sudo mv /home/steam/cs2/game/csgo/addons/counterstrikesharp/plugins/PugFlow /home/ubuntu/PugFlow-disabled
 ```
 
-从备份目录恢复原有 `server.cfg`，并按需恢复 `practice.cfg`、`live.cfg`、`knife.cfg`（要退回旧版插件，就把备份里的 `WarmupStartVote.dll` 放回插件目录），再执行：
+从备份目录恢复原有 `server.cfg`，并按需恢复 `practice.cfg`、`live.cfg`、`knife.cfg`（要退回旧版插件，就把备份里的 `PugFlow.dll` 放回插件目录），再执行：
 
 ```bash
 sudo systemctl start cs2
@@ -154,7 +160,7 @@ sudo systemctl start cs2
 
 ## 七、注意事项
 
-- 这是**轻量自定义插件**，不是 MatchZy 那种完整比赛管理系统；不提供自动队伍配置、加时赛、暂停和录像管理。
+- 这是**轻量自定义插件**，不是 MatchZy 那种完整比赛管理系统；不提供自动队伍配置、暂停和录像管理（加时由 CS2 原生 `mp_overtime_*` 处理）。
 - 当前由 CS2 原生 `round_end` 判断刀战胜队，并在胜方选边后用 `SwitchTeam()` 交换双方；服务器版本更新后建议回归测试。
 - 投票比例按**在线真人玩家数**计算，不把 Bot 算进投票人数。刀战也要求真人玩家分布在两个阵营。
 - 一名获胜队员输入的第一个有效选边指令即生效，不要求获胜队内部二次投票。
@@ -190,5 +196,47 @@ sudo systemctl start cs2
 ## 十一、v1.2.2：默认关闭友伤
 
 - `practice.cfg`、`knife.cfg`、`live.cfg` 都加入了 `mp_friendlyfire 0` 和 `mp_teammates_are_enemies 0`。热身、刀战、正式比赛中，打队友（包括手雷、燃烧弹）都不掉血。
-- CS2 竞技模式默认开启友伤，每次换图会恢复成开启。不过 `server.cfg` 和插件在换图后都会执行 `practice.cfg`，所以仍然是关闭的。
+- CS2 竞技模式默认开启友伤，每次换图会恢复成开启。不过插件在换图后会执行 `practice.cfg`，所以仍然是关闭的（v1.4.0 之前 `server.cfg` 也会执行一次）。
 - 插件代码除版本号外没有改动。只更新 cfg 的话，替换服务器上 `cfg/` 目录里的三个文件即可，不需要重新编译。
+
+## 十二、v1.3.0：!help 指令表、!ct / !t 选边、无限加时
+
+- **`!help` / `!commands`**：在聊天里列出服务器上所有玩家指令，包括本插件和 RockTheVote 的。按**当前阶段和当前玩家**着色：绿色 = 现在能用，灰色 = 现在不能用，并在括号里写明原因（例如"knife winners only""not during warmup""VIP only"）。最后一行列出其他服务器常见、但本服务器没有的指令（`!ready`、`!pause`、`!unpause`、`!tech`、`!gg`）。热身开场提示、`!startstatus`、开赛提示里都会提醒可以输入 `!help`。
+- **`!ct` / `!t` 选边**：刀战胜方可以直接说要打哪一边，不用先想清楚自己现在在哪边、该 stay 还是 swap。`!stay` / `!swap` 仍然可用，开赛提示会写明胜方最终打 CT 还是 T。
+- **无限加时**：`live.cfg` 开启 `mp_overtime_enable 1`。12:12 后打 MR3 加时（`mp_overtime_maxrounds 6`，每人 `mp_overtime_startmoney 12500`），加时打到一半换边时不暂停计时（`mp_overtime_halftime_pausetimer 0`）。`mp_overtime_limit 0` 表示加时次数不限：加时再平就继续，直到一方赢。
+- **需要同时改 CS2MenuManager 配置**：见"二、玩家命令"里关于 `!ct` 冲突的说明。
+- 需要重新编译部署（`bash install.sh`）。
+
+## 十三、v1.3.1：创意工坊地图比赛结束后能正常重载
+
+- **问题**：比赛结束后插件重载当前地图。创意工坊地图不能用 `changelevel`，旧版改用 `ds_workshop_changelevel 地图名`，但这个命令只对服务器托管的创意工坊合集（`host_workshop_collection`）有效。本服务器没有托管合集，所以在创意工坊地图上打完会卡在结算画面。
+- **现在**：创意工坊地图会去 RockTheVote 的 `maplist.txt` 里找同名条目（格式 `内部地图名:创意工坊ID`），找到就用 `host_workshop_map ID` 重载；找不到才退回旧的 `ds_workshop_changelevel`。
+- **往地图池加创意工坊地图时，冒号前要写地图的内部名称**（服务器上 `Server.MapName` 报告的名字，也就是 VPK 里 `maps/xxx.vpk` 的 xxx），不是创意工坊页面上的标题。例如 "Fy Snow"（ID 3592238209）要写成 `fy_snow_legacy:3592238209`。
+
+## 十四、v1.4.0：Rush 地图上停用比赛流程
+
+- **背景**：RockTheVote 地图池加入了 Valve 的 Rush 地图 `rush_001`（3v3，最多 6 人）。Rush 要在 `game_mode 6` 下加载才有 Rush 规则，由单独的 **ModeSwitcher** 插件负责：换到 Rush 地图前设 `game_mode 6`，换到其他地图前设回 `game_mode 1`。
+- **本插件在 Rush 地图上**：不执行 `practice.cfg`（否则无限热身、随地买枪会覆盖 Rush 规则），`!votestart` 不可用，`!help` / `!startstatus` 显示 "Rush mode"。离开 Rush 用 `!votemap <地图>` 或 `!rtv`。
+- **`server.cfg` 不再执行 `practice.cfg`**：旧版 `install.sh` 会在 `server.cfg` 末尾追加 `exec practice.cfg`，它在 Rush 地图上也会执行并覆盖 Rush 规则。v1.4.0 的 `install.sh` 会把这一行（连同旧注释）从 `server.cfg` 删掉；竞技地图的热身改由插件在换图 3 秒后执行。
+- **新增 Rush 地图时**：同时加到本插件的 `RushMaps` 和 ModeSwitcher 的 `RushMaps` 里。
+
+## 十五、v1.5.0：Rush 地图也有无限热身和开赛投票
+
+- **改动**：v1.4.0 在 Rush 上完全停用插件，Rush 只有 Valve 自带的 120 秒热身（人齐后 5 秒就开），而且会继承上一张图 `practice.cfg` 的设置（热身计时器暂停、不发 C4）。现在 Rush 地图和竞技地图一样：换图 3 秒后执行 `practice.cfg` 进入无限自由热身，`!votestart` 投票通过后**不打刀战**（Rush 没有换边），直接执行 `rush_live.cfg` 开打。
+- **`rush_live.cfg`**：先 `exec gamemode_rush.cfg` 恢复 Rush 自己的经济、回合时间和死亡不复活规则，再把 `gamemode_rush.cfg` 不管的 `practice.cfg` 设置改回来（发 C4、热身买东西收费、武器数量限制等），最后 `mp_warmup_end` + `mp_restartgame 1`。
+- **`gamemode_rush_server.cfg`**：CS2 每次加载 Rush 地图会在 `gamemode_rush.cfg` 之后自动执行它。它在地图一加载就暂停热身计时器，避免插件执行 `practice.cfg` 之前热身就自己结束。
+- 比赛结束后和竞技地图一样，15 秒后重载 Rush 地图回到热身；所有人退出也回到热身。
+- `install.sh` 会安装并备份这两个 cfg。
+
+## 十六、v1.5.1：空服时自动重载地图，防止手部动作慢动作
+
+- **问题**：关掉休眠后，地图在空服状态下连续运行了约 9 小时。之后进服的玩家走路正常，但手上的动作（切枪、换弹、检视）变成慢动作。换一次图就恢复正常，确认原因是同一张图跑太久：游戏时间只在换图时归零，数值太大后浮点精度不够，动画就会变慢。
+- **现在**：插件每 60 秒检查一次。服务器没有真人玩家，并且当前地图已经运行超过 1 小时（`StaleMapSeconds`），就重载当前地图（创意工坊地图也能重载，Rush 地图保持 Rush 模式）。日志里会出现 `[PugFlow] Server empty and <地图> has run X.Xh: reloading it`。
+- **有人在线时不会重载**。如果大家在同一张图上连续玩了很多个小时，手部动作又开始变慢，换一次图即可（`!votemap`，或管理员 `/rcon changelevel <地图>`）。
+
+## 十七、v1.6.0：改名为 CS2-PugFlow
+
+- 插件原名 **WarmupStartVote**（仓库 CS2-WarmupStart-knife-round）。功能早已不止热身投票和刀战，现在管理整场朋友局（PUG）的流程，所以改名为 **CS2-PugFlow**。
+- 改动：插件名 `PugFlow`，DLL 和插件目录 `plugins/PugFlow/`，聊天和日志前缀 `[StartVote]` / `[WarmupStartVote]` → `[PugFlow]`。
+- **玩家指令全部不变**（`!votestart`、`!yes`、`!ct`、`!startstatus`、`!startreset` 等）。
+- 从旧版升级：`install.sh` 会把旧的 `plugins/WarmupStartVote/` 移到本次备份目录里，防止新旧两个插件同时加载、每条指令执行两次。

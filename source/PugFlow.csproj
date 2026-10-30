@@ -4,8 +4,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <AssemblyName>WarmupStartVote</AssemblyName>
-    <RootNamespace>WarmupStartVote</RootNamespace>
+    <AssemblyName>PugFlow</AssemblyName>
+    <RootNamespace>PugFlow</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="CounterStrikeSharp.API">
